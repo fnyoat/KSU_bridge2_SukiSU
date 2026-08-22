@@ -1,0 +1,170 @@
+name: Build sukisu_bridge for multiple kernels
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # 每个内核一个 job：克隆对应 GKI 分支 → 配置（关 INIT_STACK_ALL_ZERO）→
+  # modules_prepare → 用匹配的 clang 编译 .ko → 打包 KSU 模块
+  build:
+    name: ${{ matrix.kernel }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 标准 GKI 分支矩阵。NDK 必须匹配各分支官方 clang 代际（kCFI 类型哈希与
+          # clang 版本相关，用错代 insmod 即 PAN / rmmod 必报 CFI failure）：
+          #   android11-5.4         -> clang 11 (NDK r21e)
+          #   android12-5.10        -> clang 12 (NDK r23b, 设备验证)
+          #   android13-5.10 / 5.15 -> clang 14 (NDK r25b)
+          #   android14-5.15 / 6.1  -> clang 17 (NDK r27)
+          #   android15-6.6         -> clang 18 (NDK r28)
+          # 注意：产物只对标准 GKI 分支有效；厂商定制 / 自编译内核必须自行编译
+          #（见 README 开发者指南），不可直接使用本矩阵产物。
+          - kernel: android11-5.4
+            ndk: r21e
+            ndk_url: https://dl.google.com/android/repository/android-ndk-r21e-linux-x86_64.zip
+            id_suffix: 11_5_4
+            ver: 1.0
+            desc: "GKI 5.4 (Android 11)"
+          - kernel: android12-5.10
+            ndk: r23b          # clang 12.0.8，与设备同代，kCFI hash 匹配
+            ndk_url: https://dl.google.com/android/repository/android-ndk-r23b-linux.zip
+            id_suffix: 12_5_10
+            ver: 1.0
+            desc: "GKI 5.10 (Android 12), device-verified"
+          - kernel: android13-5.10
+            ndk: r25b
+            ndk_url: https://dl.google.com/android/repository/android-ndk-r25b-linux.zip
+            id_suffix: 13_5_10
+            ver: 1.0
+            desc: "GKI 5.10 (Android 13)"
+          - kernel: android13-5.15
+            ndk: r25b
+            ndk_url: https://dl.google.com/android/repository/android-ndk-r25b-linux.zip
+            id_suffix: 13_5_15
+            ver: 1.0
+            desc: "GKI 5.15 (Android 13)"
+          - kernel: android14-5.15
+            ndk: r27
+            ndk_url: https://dl.google.com/android/repository/android-ndk-r27-linux.zip
+            id_suffix: 14_5_15
+            ver: 1.0
+            desc: "GKI 5.15 (Android 14)"
+          - kernel: android14-6.1
+            ndk: r27
+            ndk_url: https://dl.google.com/android/repository/android-ndk-r27-linux.zip
+            id_suffix: 14_6_1
+            ver: 1.0
+            desc: "GKI 6.1 (Android 14)"
+          - kernel: android15-6.6
+            ndk: r28
+            ndk_url: https://dl.google.com/android/repository/android-ndk-r28-linux.zip
+            id_suffix: 15_6_6
+            ver: 1.0
+            desc: "GKI 6.6 (Android 15)"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev gcc g++ make git curl xz-utils zip
+
+      - name: Cache NDK ${{ matrix.ndk }}
+        id: cache-ndk
+        uses: actions/cache@v5
+        with:
+          path: /opt/android-ndk-${{ matrix.ndk }}
+          key: ndk-${{ matrix.ndk }}-linux
+
+      - name: Download NDK ${{ matrix.ndk }}
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        run: |
+          # 下载文件名不统一：r21e 是 android-ndk-r21e-linux-x86_64.zip，
+          # r23b 起是 android-ndk-rXXb-linux.zip。URL 写死在矩阵的 ndk_url 字段。
+          curl -L -o ndk.zip "${{ matrix.ndk_url }}"
+          unzip -q ndk.zip -d /opt
+
+      - name: Cache GKI kernel (${{ matrix.kernel }})
+        id: cache-gki
+        uses: actions/cache@v5
+        with:
+          path: /home/runner/gki
+          # key 必须含 NDK 维度：内核树（尤其 LTO 相关配置/工具）由对应 NDK 的
+          # clang 生成，跨 NDK 复用缓存会导致 CC(clang 18) 与 LTO 链接器(ld.lld 14)
+          # 版本不匹配 -> "Opaque pointers are only supported in -opaque-pointers
+          # mode (Producer: LLVM18.1.3 Reader: LLVM 14.0.6)"。
+          key: gki-${{ matrix.kernel }}-${{ matrix.ndk }}
+
+      - name: Clone GKI ${{ matrix.kernel }}
+        if: steps.cache-gki.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://android.googlesource.com/kernel/common /home/runner/gki -b ${{ matrix.kernel }}
+
+      - name: Patch clang11-incompatible warning flags (android11-5.4)
+        if: matrix.kernel == 'android11-5.4'
+        working-directory: /home/runner/gki
+        run: |
+          # android11-5.4 的 scripts/Makefile.extrawarn 无条件加
+          # -Wno-enum-compare-conditional（clang 12 才认识的选项），NDK r21e 的
+          # clang 11 不认，被 -Werror 提升为 error。直接删掉该行。
+          sed -i '/-Wno-enum-compare-conditional/d' scripts/Makefile.extrawarn
+
+      - name: Prepare kernel (config + modules_prepare)
+        working-directory: /home/runner/gki
+        env:
+          TCHAIN: /opt/android-ndk-${{ matrix.ndk }}/toolchains/llvm/prebuilt/linux-x86_64/bin
+          # 老内核（android11-5.4 等）检测到 NDK clang 默认 target 带 Android 时
+          # 强制要求显式 CLANG_TRIPLE，否则报 "Clang with Android --target
+          # detected. Did you specify CLANG_TRIPLE?"。AOSP 官方 GKI 统一用
+          # aarch64-linux-gnu-，全分支一致（build_mod.sh 也早已 export 同值）。
+          CLANG_TRIPLE: aarch64-linux-gnu-
+        run: |
+          # LLVM=1 时内核构建需要 ld.lld / llvm-nm / llvm-ar 等，必须把 NDK 工具链
+          # bin 目录加进 PATH（只设 CC 不够，gki_defconfig 阶段就会找不到 ld.lld）。
+          export PATH="$TCHAIN:$PATH"
+          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-android- HOSTCC=gcc CC="$TCHAIN/clang" gki_defconfig
+          # gki_defconfig 开启 CONFIG_INIT_STACK_ALL_ZERO，内核 Makefile 会无条件追加
+          # Android 专用 clang flag '-enable-trivial-auto-var-init-zero-...'，NDK 上游
+          # clang 不认识 -> 编译 .ko 报 unknown argument。该选项只影响内核自身栈初始化
+          # 策略，与模块无关（设备 .config 也是关的）。必须在 modules_prepare 之前关掉，
+          # 否则生成的 auto.conf 会带该配置。build_mod.sh 里也有兜底（双保险）。
+          "$(pwd)/scripts/config" --file .config --disable INIT_STACK_ALL
+          "$(pwd)/scripts/config" --file .config --disable INIT_STACK_ALL_ZERO
+          "$(pwd)/scripts/config" --file .config --disable INIT_STACK_ALL_PATTERN
+          # CI 从不构建 vmlinux，KDIR 里没有真实 Module.symvers（modpost 需要它才能
+          # 解析符号 CRC），且官方 GKI 还开 MODULE_SIG_FORCE 强制签名——无论哪种
+          # 门槛 CI 产物都过不了。统一关掉 modversions：模块不带 __versions 段，
+          # 加载时按符号名解析、不查 CRC（配合 build_mod.sh 的 KBUILD_MODPOST_WARN）。
+          # 真机/正式用途请按 README 开发者指南用真实内核树自编译。
+          "$(pwd)/scripts/config" --file .config --disable MODVERSIONS
+          "$(pwd)/scripts/config" --file .config --disable ASM_MODVERSIONS
+          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-android- HOSTCC=gcc CC="$TCHAIN/clang" olddefconfig
+          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-android- HOSTCC=gcc CC="$TCHAIN/clang" modules_prepare -j"$(nproc)"
+
+      - name: Build module
+        env:
+          KDIR: /home/runner/gki
+          NDK: /opt/android-ndk-${{ matrix.ndk }}
+        run: bash build_mod.sh
+
+      - name: Package KSU module
+        run: |
+          bash build_module.sh \
+            sukisu_bridge.ko \
+            ${{ matrix.kernel }} \
+            ${{ matrix.id_suffix }} \
+            ${{ matrix.ver }} \
+            "${{ matrix.desc }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: KSU_bridge2_SukiSU-${{ matrix.kernel }}
+          path: dist/KSU_bridge2_SukiSU-${{ matrix.kernel }}.zip

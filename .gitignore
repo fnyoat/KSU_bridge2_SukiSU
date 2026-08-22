@@ -1,0 +1,32 @@
+# --- kernel module build artifacts ---
+*.ko
+*.ko.*
+*.o
+*.o.*
+*.mod
+*.mod.c
+*.mod.o
+*.mod.cmd
+*.lto.o
+*.lds
+*.tmp.ko
+Module.symvers
+modules.order
+build_mod.log
+.thinlto-cache/
+
+# kbuild per-target command/dep files
+.*.cmd
+.*.d
+.*.o.d
+.*.mod.cmd
+.*.ko.cmd
+.*.o.cmd
+
+# --- module packaging ---
+dist/
+
+# --- editors / OS noise ---
+.DS_Store
+*.swp
+*.tmp

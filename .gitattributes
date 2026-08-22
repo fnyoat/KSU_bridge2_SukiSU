@@ -1,0 +1,8 @@
+# 强制 shell 脚本与 Makefile 使用 LF，避免 Windows checkout 转成 CRLF 后
+# 在 CI（Ubuntu）上执行失败（/bin/bash^M: bad interpreter）。
+*.sh        text eol=lf
+Makefile    text eol=lf
+*.c         text
+*.h         text
+*.md        text
+*.yml       text
